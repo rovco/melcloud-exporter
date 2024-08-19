@@ -32,6 +32,5 @@ func ReadConfig(filename string) (*Config, error) {
 	if err = yaml.NewDecoder(file).Decode(&config); err != nil {
 		return nil, err
 	}
-
 	return &config, nil
 }
