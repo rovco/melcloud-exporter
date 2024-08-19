@@ -44,10 +44,10 @@ var (
 		Name: "melcloud_device_fan_speed",
 		Help: "The speed of the fan in the device",
 	}, deviceLabelNames)
-	counterCurrentEnergyConsumed = promauto.NewCounter(prometheus.CounterOpts{
+	counterCurrentEnergyConsumed = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "melcloud_device_current_energy_consumed",
 		Help: "The current energy consumed by devices",
-	})
+	}, deviceLabelNames)
 	gaugeDeviceDemandPercentage = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "melcloud_device_demand_percentage",
 		Help: "The demand percentage of the device",
