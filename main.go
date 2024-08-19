@@ -116,7 +116,7 @@ func updateData() error {
 		gaugeDeviceTemperatureRoom.With(labels).Set(float64(dev.Device.RoomTemperature))
 		gaugeDeviceTemperatureSet.With(labels).Set(float64(dev.Device.SetTemperature))
 		gaugeDeviceFanSpeed.With(labels).Set(float64(dev.Device.ActualFanSpeed))
-		counterCurrentEnergyConsumed.Add(float64(dev.Device.CurrentEnergyConsumed))
+		counterCurrentEnergyConsumed.With(labels).Add(float64(dev.Device.CurrentEnergyConsumed))
 		gaugeDeviceDemandPercentage.With(labels).Set(float64(dev.Device.DemandPercentage))
 
 		autoFanSpeed := 0.0
