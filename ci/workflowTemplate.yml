@@ -43,52 +43,45 @@ spec:
                 : "${TAG:?}"
                 : "${REVISION:?}"
 
-                  # Defensive validation before either value reaches a git/shell
-                # command. The repository is fixed (no caller-controlled repo
-                # parameter exists in this WorkflowTemplate); tag/revision
-                # still originate from Sensor-mapped webhook data once Phase 4
-                # wires the trigger, so they are validated here even though
-                # this phase only exercises manual, trusted `argo submit`.
                 printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
                   || { echo "refusing unsafe tag '$TAG': expected exactly X.Y.Z" >&2; exit 1; }
                 printf '%s' "$REVISION" | grep -Eq '^[0-9a-f]{40}$' \
                   || { echo "refusing unsafe revision '$REVISION': expected a 40-hex git object id" >&2; exit 1; }
 
                 mkdir -p /workspace/src /workspace/outputs
+
                 cd /workspace/src
+
                 git init --quiet .
-                git remote add origin "https://github.com/rovco/go-pulp.git"
-                # Keeps the token out of argv/`git remote -v`/process listing -
-                # it is only ever read from $GITHUB_TOKEN inside this shell
-                # function at credential-negotiation time.
+
+                git remote add origin "https://github.com/rovco/melcloud-exporter.git"
+
                 git config --local credential.helper \
                   '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
 
-                # Fails with an explicit, specific message instead of letting
-                # a nonexistent tag surface as git fetch's generic "couldn't
-                # find remote ref" - which itself only showed up buried in
-                # this container's own log, behind a confusing top-level
-                # "no such file or directory" error from output-parameter
-                # collection once `main` never ran.
-                if ! git ls-remote --exit-code origin "refs/tags/${TAG}" >/dev/null; then
+                if ! git ls-remote --exit-code origin "refs/tags/${TAG}"
+                >/dev/null; then
                   echo "tag '$TAG' does not exist on $(git remote get-url origin)" >&2
                   exit 1
                 fi
 
-                git fetch --quiet --depth 1 origin "refs/tags/${TAG}:refs/tags/${TAG}"
+
+                git fetch --quiet --depth 1 origin
+                "refs/tags/${TAG}:refs/tags/${TAG}"
+
 
                 TAG_OBJECT=$(git rev-parse "refs/tags/${TAG}")
+
                 TAG_TYPE=$(git cat-file -t "$TAG_OBJECT")
+
                 PEELED_COMMIT=$(git rev-parse "refs/tags/${TAG}^{commit}")
 
-                # `git cat-file -t` on the *supplied* revision - not FETCH_HEAD -
-                # is what distinguishes a lightweight tag (revision IS a commit,
-                # compared directly) from an annotated tag (revision is the tag
-                # object's own SHA, peeled to its commit before comparison).
-                if ! REVISION_TYPE=$(git cat-file -t "$REVISION" 2>/dev/null); then
+                if ! REVISION_TYPE=$(git cat-file -t "$REVISION" 2>/dev/null);
+                then
                   echo "revision $REVISION is not an object reachable from fetched tag $TAG - rejecting" >&2
                   exit 1
                 fi
+
 
                 case "$REVISION_TYPE" in
                   tag)
@@ -103,17 +96,24 @@ spec:
                     ;;
                 esac
 
+
                 if [ "$REVISION_PEELED" != "$PEELED_COMMIT" ]; then
                   echo "revision mismatch: supplied $REVISION ($REVISION_TYPE, peels to $REVISION_PEELED) does not match fetched tag $TAG (peels to $PEELED_COMMIT)" >&2
                   exit 1
                 fi
 
+
                 git checkout --quiet "$PEELED_COMMIT"
 
-                printf '%s' "$TAG_OBJECT" > /workspace/outputs/tag-object.txt
-                printf '%s' "$PEELED_COMMIT" > /workspace/outputs/peeled-commit.txt
 
-                echo "verified tag=$TAG tag_object=$TAG_OBJECT ($TAG_TYPE) peeled_commit=$PEELED_COMMIT"
+                printf '%s' "$TAG_OBJECT" > /workspace/outputs/tag-object.txt
+
+                printf '%s' "$PEELED_COMMIT" >
+                /workspace/outputs/peeled-commit.txt
+
+
+                echo "verified tag=$TAG tag_object=$TAG_OBJECT ($TAG_TYPE)
+                peeled_commit=$PEELED_COMMIT"
             env:
               - name: TAG
                 value: "{{inputs.parameters.tag}}"
@@ -141,17 +141,23 @@ spec:
                   - ALL
               allowPrivilegeEscalation: false
           - name: main
-            image: docker.op.vaarst.io/docker_proxy/golang:1.27.3-bookworm
+            dependencies:
+              - clone
+            image: "docker.op.vaarst.io/docker_proxy/moby/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea"
+            imagePullPolicy: IfNotPresent
+            env:
+              - name: TAG
+                value: "{{inputs.parameters.tag}}"
+              - name: DOCKER_CONFIG
+                value: /etc/buildkit-registry
             command:
-              - /bin/bash
+              - sh
               - -c
               - |
-                printf '%s\n'  "========= Starting Build ========="
-
                 set -euo pipefail
 
                 : "${TAG:?}"
-                 IMAGE="docker.op.vaarst.io/vaarst_docker/go-pulp:${TAG}-argo"
+                 IMAGE="docker.op.vaarst.io/devops/melcloud-exporter:${TAG}-argo"
 
                 mkdir -p /workspace/outputs
 
@@ -168,6 +174,36 @@ spec:
                   --output "type=image,name=${IMAGE},push=true" \
                   --metadata-file /workspace/outputs/buildkit-metadata.json
 
+                # Neither jq nor python3 is present in this (confirmed:
+                # `docker run --entrypoint sh ... command -v jq python3`)
+                # upstream moby/buildkit image, so extraction uses BusyBox
+                # awk instead of a `grep -o | sed` pipeline: a pipeline's
+                # final exit status is only the *last* command's (BusyBox sh
+                # has no `pipefail`), so a `grep -o` that finds nothing would
+                # still let a downstream `sed`/`head` exit 0 on empty input,
+                # silently producing an empty $DIGEST instead of failing the
+                # extraction step itself. A single `awk` program has no pipe
+                # to bypass: it reads the file directly, and one `exit`
+                # inside the matched pattern's action both stops at the
+                # first match (no separate `head -n1`) and is the only exit
+                # status the command substitution ever sees.
+                #
+                # `--metadata-file`'s `containerimage.digest` key is only
+                # ever top-level JSON (not platform-suffixed - see
+                # moby/buildkit exporter/containerimage/exptypes, suffixing
+                # is reserved for containerimage.config/
+                # containerimage.base.config on multi-platform builds, which
+                # this single-`--opt platform` build never produces) with a
+                # plain string value. Confirmed against a real
+                # `buildctl --metadata-file` run (this task's own
+                # verification, not merely reviewed by inspection) that the
+                # exact key is `"containerimage.digest"` with a sibling
+                # `"containerimage.config.digest"` key present in the same
+                # file - the quoted, anchored pattern below matches only the
+                # former, never the latter.
+                #
+                 # Treat parser misses/errors as an empty result so set -e
+                 # cannot bypass the explicit, useful validation below.
                  DIGEST=$(awk -F'"' '/"containerimage\.digest"/ { print $4; exit }' \
                    /workspace/outputs/buildkit-metadata.json || true)
 
@@ -183,52 +219,37 @@ spec:
                 printf '%s' "linux/amd64" > /workspace/outputs/platform.txt
 
                 echo "built image=$IMAGE digest=$DIGEST platform=linux/amd64"
-            env:
-              - name: TAG
-                value: "{{inputs.parameters.tag}}"
-              - name: DOCKER_CONFIG
-                value: /etc/buildkit-registry
-              - name: ORAS_VERSION
-                value: "1.3.4"
-              - name: TOOLS_INSTALLDIR
-                value: "/workspace/tools-install"
-              - name: GOCACHE
-                value: /workspace/.cache/go-build
-              - name: GOMODCACHE
-                value: /workspace/.cache/go-mod
-              - name: GOOS
-                value: linux
-              - name: GOARCH
-                value: amd64
-              - name: JQ_VERSION
-                value: "1.8.2"
             resources:
               limits:
-                cpu: "4"
+                cpu: "2"
                 memory: 2Gi
               requests:
                 cpu: "1"
                 memory: 1Gi
-            volumeMounts:
-              - name: workspace
-                mountPath: /workspace
-              - name: registry-config
-                readOnly: true
-                mountPath: /etc/buildkit-registry
-            imagePullPolicy: IfNotPresent
             securityContext:
+              allowPrivilegeEscalation: false
               capabilities:
                 drop:
                   - ALL
-              allowPrivilegeEscalation: false
-            dependencies:
-              - clone
+            volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+              - name: client-cert
+                mountPath: /etc/buildkit-client
+                readOnly: true
+              - name: registry-config
+                mountPath: /etc/buildkit-registry
+                readOnly: true
+
           - name: cleanup
-            image: docker.op.vaarst.io/docker_proxy/alpine/git@sha256:a4bb51f1a3553df194ce679fc1db721d8bfba2046fa1a88fe9d4ac551ffbce25
+            dependencies:
+              - main
+            image: "docker.op.vaarst.io/docker_proxy/alpine/git@sha256:a4bb51f1a3553df194ce679fc1db721d8bfba2046fa1a88fe9d4ac551ffbce25"
+            imagePullPolicy: IfNotPresent
             command:
               - sh
               - -c
-              - rm -rf /workspace/src
+              - "rm -rf /workspace/src"
             resources:
               limits:
                 cpu: 100m
@@ -236,17 +257,14 @@ spec:
               requests:
                 cpu: 50m
                 memory: 32Mi
-            volumeMounts:
-              - name: workspace
-                mountPath: /workspace
-            imagePullPolicy: IfNotPresent
             securityContext:
+              allowPrivilegeEscalation: false
               capabilities:
                 drop:
                   - ALL
-              allowPrivilegeEscalation: false
-            dependencies:
-              - main
+            volumeMounts:
+              - name: workspace
+                mountPath: /workspace
       volumes:
         - name: workspace
           emptyDir: {}
