@@ -54,7 +54,7 @@ spec:
 
                 git init --quiet .
 
-                git remote add origin "https://github.com/rovco/prometheus_hypervisor_service_discovery.git"
+                git remote add origin "https://github.com/rovco/melcloud-exporter.git"
 
                 git config --local credential.helper \
                   '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
@@ -146,57 +146,43 @@ spec:
               - /bin/bash
               - -c
               - |
+                printf '%s\n'  "========= Starting Build ========="
+
                 set -euo pipefail
 
                 : "${TAG:?}"
-                 IMAGE="docker.op.vaarst.io/vaarst_docker/pve-discovery:${TAG}-argo"
+                 IMAGE="docker.op.vaarst.io/vaarst_docker/go-pulp:${TAG}-argo"
 
                 mkdir -p /workspace/outputs
-                mkdir -p "$GOCACHE" "$GOMODCACHE"
 
-                cd /workspace/src
+                buildctl \
+                  --addr "tcp://buildkitd.buildkit.svc:1234" \
+                  --tlscacert /etc/buildkit-client/ca.crt \
+                  --tlscert /etc/buildkit-client/tls.crt \
+                  --tlskey /etc/buildkit-client/tls.key \
+                  build \
+                  --frontend dockerfile.v0 \
+                  --local context=/workspace/src \
+                  --local dockerfile=/workspace/src \
+                  --opt platform=linux/amd64 \
+                  --output "type=image,name=${IMAGE},push=true" \
+                  --metadata-file /workspace/outputs/buildkit-metadata.json
 
-                printf '%s\n'  "========= Starting Build ========="
+                 DIGEST=$(awk -F'"' '/"containerimage\.digest"/ { print $4; exit }' \
+                   /workspace/outputs/buildkit-metadata.json || true)
 
-                go build -o /workspace/outputs/pve-prometheus-service-discovery ./cmd/discovery
+                if ! awk -v digest="$DIGEST" \
+                  'BEGIN { exit !(length(digest) == 71 && digest ~ /^sha256:[0-9a-f]+$/) }'; then
+                  echo "could not find a valid containerimage.digest (expected sha256:<64 hex chars>) in buildctl metadata file:" >&2
+                  awk '{ print }' /workspace/outputs/buildkit-metadata.json >&2
+                  exit 1
+                fi
 
-                printf '%szn'  "========= Setup Oras ========="
-
-                curl -LO "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
-                mkdir -p ${TOOLS_INSTALLDIR}/oras
-                tar -zxf oras_${ORAS_VERSION}_*.tar.gz -C ${TOOLS_INSTALLDIR}/oras
-
-                printf '%s\n'  "========= Upload Artifact ========="
-
-                OUTPUT=$(
-                  ${TOOLS_INSTALLDIR}/oras/oras push \
-                    --disable-path-validation \
-                    "docker.op.vaarst.io/go/pve-prometheus-service-discovery:${TAG}" \
-                    /workspace/outputs/pve-prometheus-service-discovery \
-                    --format json
-                )
-
-                printf '%s\n'  "========= Setup yq ========="
-
-                curl -LO https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-linux-amd64
-                mkdir -p ${TOOLS_INSTALLDIR}/jq
-                mv jq-linux-amd64 ${TOOLS_INSTALLDIR}/jq/jq
-                chmod +x /workspace/tools-install/jq/jq
-
-                printf '%s\n'  "========= Define Outputs ========="
-
-                DIGEST=$("${TOOLS_INSTALLDIR}/jq/jq" -r '.digest' <<< "$OUTPUT")
-                IMAGE=$("${TOOLS_INSTALLDIR}/jq/jq" -r '.referenceAsTags[0]' <<< "$OUTPUT")
-
-                printf '%s\n' "$DIGEST" > /workspace/outputs/manifest-digest.txt
-
-                printf '%s\n' "$IMAGE" > /workspace/outputs/image-reference.txt
-
-                printf '%s\n' "linux/amd64" > /workspace/outputs/platform.txt
+                printf '%s' "$DIGEST" > /workspace/outputs/manifest-digest.txt
+                printf '%s' "$IMAGE" > /workspace/outputs/image-reference.txt
+                printf '%s' "linux/amd64" > /workspace/outputs/platform.txt
 
                 echo "built image=$IMAGE digest=$DIGEST platform=linux/amd64"
-
-                printf '\n%s'  "========================="
             env:
               - name: TAG
                 value: "{{inputs.parameters.tag}}"
