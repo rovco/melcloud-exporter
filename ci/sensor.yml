@@ -74,7 +74,7 @@ spec:
         name: forward-body
         http:
           # Replace service, namespace, port and path with your receiver.
-          url: http://argocd-server.argocd.svc.cluster.local:80/api/webhook
+          url: http://argocd-server.argocd.svc.cluster.local/api/webhook
           method: POST
           headers:
             Content-Type: application/json
