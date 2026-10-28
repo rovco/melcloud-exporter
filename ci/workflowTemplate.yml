@@ -6,12 +6,32 @@ metadata:
   name: melcloud-exporter-build
   namespace: melcloud-exporter-ci
 spec:
+  entrypoint: build
+  serviceAccountName: melcloud-exporter-builder
+  arguments:
+    parameters:
+      - name: tag
+      - name: revision
   templates:
     - name: build
       inputs:
         parameters:
           - name: tag
           - name: revision
+      activeDeadlineSeconds: 1800
+      retryStrategy:
+        limit: 2
+        retryPolicy: OnFailure
+        backoff:
+          duration: "30s"
+          factor: "2"
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
       outputs:
         parameters:
           - name: tag-object
@@ -29,59 +49,88 @@ spec:
           - name: platform
             valueFrom:
               path: /workspace/outputs/platform.txt
-      metadata: {}
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: client-cert
+          secret:
+            secretName: melcloud-exporter-buildkit-client-tls
+        - name: registry-config
+          secret:
+            secretName: melcloud-exporter-registry
+            items:
+              - key: .dockerconfigjson
+                path: config.json
       containerSet:
         containers:
           - name: clone
-            image: docker.op.vaarst.io/docker_proxy/alpine/git@sha256:a4bb51f1a3553df194ce679fc1db721d8bfba2046fa1a88fe9d4ac551ffbce25
+            image: "docker.op.vaarst.io/docker_proxy/alpine/git@sha256:a4bb51f1a3553df194ce679fc1db721d8bfba2046fa1a88fe9d4ac551ffbce25"
+            imagePullPolicy: IfNotPresent
+            env:
+              - name: TAG
+                value: "{{inputs.parameters.tag}}"
+              - name: REVISION
+                value: "{{inputs.parameters.revision}}"
+              - name: GITHUB_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: go-pulp-git
+                    key: token
             command:
               - sh
               - -c
-              - >
+              - |
                 set -euo pipefail
 
                 : "${TAG:?}"
                 : "${REVISION:?}"
 
+                # Defensive validation before either value reaches a git/shell
+                # command. The repository is fixed (no caller-controlled repo
+                # parameter exists in this WorkflowTemplate); tag/revision
+                # still originate from Sensor-mapped webhook data once Phase 4
+                # wires the trigger, so they are validated here even though
+                # this phase only exercises manual, trusted `argo submit`.
                 printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
                   || { echo "refusing unsafe tag '$TAG': expected exactly X.Y.Z" >&2; exit 1; }
                 printf '%s' "$REVISION" | grep -Eq '^[0-9a-f]{40}$' \
                   || { echo "refusing unsafe revision '$REVISION': expected a 40-hex git object id" >&2; exit 1; }
 
                 mkdir -p /workspace/src /workspace/outputs
-
                 cd /workspace/src
-
                 git init --quiet .
-
                 git remote add origin "https://github.com/rovco/melcloud-exporter.git"
-
+                # Keeps the token out of argv/`git remote -v`/process listing -
+                # it is only ever read from $GITHUB_TOKEN inside this shell
+                # function at credential-negotiation time.
                 git config --local credential.helper \
                   '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
 
-                if ! git ls-remote --exit-code origin "refs/tags/${TAG}"
-                >/dev/null; then
+                # Fails with an explicit, specific message instead of letting
+                # a nonexistent tag surface as git fetch's generic "couldn't
+                # find remote ref" - which itself only showed up buried in
+                # this container's own log, behind a confusing top-level
+                # "no such file or directory" error from output-parameter
+                # collection once `main` never ran.
+                if ! git ls-remote --exit-code origin "refs/tags/${TAG}" >/dev/null; then
                   echo "tag '$TAG' does not exist on $(git remote get-url origin)" >&2
                   exit 1
                 fi
 
-
-                git fetch --quiet --depth 1 origin
-                "refs/tags/${TAG}:refs/tags/${TAG}"
-
+                git fetch --quiet --depth 1 origin "refs/tags/${TAG}:refs/tags/${TAG}"
 
                 TAG_OBJECT=$(git rev-parse "refs/tags/${TAG}")
-
                 TAG_TYPE=$(git cat-file -t "$TAG_OBJECT")
-
                 PEELED_COMMIT=$(git rev-parse "refs/tags/${TAG}^{commit}")
 
-                if ! REVISION_TYPE=$(git cat-file -t "$REVISION" 2>/dev/null);
-                then
+                # `git cat-file -t` on the *supplied* revision - not FETCH_HEAD -
+                # is what distinguishes a lightweight tag (revision IS a commit,
+                # compared directly) from an annotated tag (revision is the tag
+                # object's own SHA, peeled to its commit before comparison).
+                if ! REVISION_TYPE=$(git cat-file -t "$REVISION" 2>/dev/null); then
                   echo "revision $REVISION is not an object reachable from fetched tag $TAG - rejecting" >&2
                   exit 1
                 fi
-
 
                 case "$REVISION_TYPE" in
                   tag)
@@ -96,34 +145,17 @@ spec:
                     ;;
                 esac
 
-
                 if [ "$REVISION_PEELED" != "$PEELED_COMMIT" ]; then
                   echo "revision mismatch: supplied $REVISION ($REVISION_TYPE, peels to $REVISION_PEELED) does not match fetched tag $TAG (peels to $PEELED_COMMIT)" >&2
                   exit 1
                 fi
 
-
                 git checkout --quiet "$PEELED_COMMIT"
 
-
                 printf '%s' "$TAG_OBJECT" > /workspace/outputs/tag-object.txt
+                printf '%s' "$PEELED_COMMIT" > /workspace/outputs/peeled-commit.txt
 
-                printf '%s' "$PEELED_COMMIT" >
-                /workspace/outputs/peeled-commit.txt
-
-
-                echo "verified tag=$TAG tag_object=$TAG_OBJECT ($TAG_TYPE)
-                peeled_commit=$PEELED_COMMIT"
-            env:
-              - name: TAG
-                value: "{{inputs.parameters.tag}}"
-              - name: REVISION
-                value: "{{inputs.parameters.revision}}"
-              - name: GITHUB_TOKEN
-                valueFrom:
-                  secretKeyRef:
-                    name: melcloud-exporter-git
-                    key: token
+                echo "verified tag=$TAG tag_object=$TAG_OBJECT ($TAG_TYPE) peeled_commit=$PEELED_COMMIT"
             resources:
               limits:
                 cpu: 500m
@@ -131,15 +163,15 @@ spec:
               requests:
                 cpu: 100m
                 memory: 128Mi
-            volumeMounts:
-              - name: workspace
-                mountPath: /workspace
-            imagePullPolicy: IfNotPresent
             securityContext:
+              allowPrivilegeEscalation: false
               capabilities:
                 drop:
                   - ALL
-              allowPrivilegeEscalation: false
+            volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+
           - name: main
             dependencies:
               - clone
@@ -265,34 +297,3 @@ spec:
             volumeMounts:
               - name: workspace
                 mountPath: /workspace
-      volumes:
-        - name: workspace
-          emptyDir: {}
-        - name: registry-config
-          secret:
-            secretName: melcloud-exporter-registry
-            items:
-              - key: .dockerconfigjson
-                path: config.json
-      activeDeadlineSeconds: 1800
-      retryStrategy:
-        limit: 1
-        retryPolicy: OnFailure
-        backoff:
-          duration: 30s
-          factor: "2"
-      securityContext:
-        runAsUser: 65532
-        runAsGroup: 65532
-        runAsNonRoot: true
-        fsGroup: 65532
-        seccompProfile:
-          type: RuntimeDefault
-  entrypoint: build
-  ttlStrategy:
-    secondsAfterCompletion: 43200
-  arguments:
-    parameters:
-      - name: tag
-      - name: revision
-  serviceAccountName: melcloud-exporter-ci
