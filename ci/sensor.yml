@@ -70,3 +70,29 @@ spec:
                 dependencyName: github-tag-push
                 dataTemplate: melcloud-exporter-{{ .Input.body.ref | trimPrefix "refs/tags/" }}
               dest: metadata.name
+    - template:
+        name: forward-body
+        http:
+          # Replace service, namespace, port and path with your receiver.
+          url: http://argocd-server.argocd.svc.cluster.local:80/api/webhook
+          method: POST
+          headers:
+            Content-Type: application/json
+          payload:
+            - src:
+                dependencyName: github-event
+                dataKey: body
+                useRawData: true
+              dest: ""
+
+      retryStrategy:
+        steps: 3
+        duration: 2s
+
+      policy:
+        status:
+          allow:
+            - 200
+            - 201
+            - 202
+            - 204
