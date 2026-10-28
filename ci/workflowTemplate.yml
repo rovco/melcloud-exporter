@@ -1,0 +1,294 @@
+---
+# yaml-language-server: $schema=https://datreeio.github.io/CRDs-catalog/argoproj.io/workflowtemplate_v1alpha1.json
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: melcloud-exporter-build
+  namespace: melcloud-exporter-ci
+spec:
+  templates:
+    - name: build
+      inputs:
+        parameters:
+          - name: tag
+          - name: revision
+      outputs:
+        parameters:
+          - name: tag-object
+            valueFrom:
+              path: /workspace/outputs/tag-object.txt
+          - name: peeled-commit
+            valueFrom:
+              path: /workspace/outputs/peeled-commit.txt
+          - name: image-reference
+            valueFrom:
+              path: /workspace/outputs/image-reference.txt
+          - name: manifest-digest
+            valueFrom:
+              path: /workspace/outputs/manifest-digest.txt
+          - name: platform
+            valueFrom:
+              path: /workspace/outputs/platform.txt
+      metadata: {}
+      containerSet:
+        containers:
+          - name: clone
+            image: docker.op.vaarst.io/docker_proxy/alpine/git@sha256:a4bb51f1a3553df194ce679fc1db721d8bfba2046fa1a88fe9d4ac551ffbce25
+            command:
+              - sh
+              - -c
+              - >
+                set -euo pipefail
+
+                : "${TAG:?}"
+                : "${REVISION:?}"
+
+                printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                  || { echo "refusing unsafe tag '$TAG': expected exactly X.Y.Z" >&2; exit 1; }
+                printf '%s' "$REVISION" | grep -Eq '^[0-9a-f]{40}$' \
+                  || { echo "refusing unsafe revision '$REVISION': expected a 40-hex git object id" >&2; exit 1; }
+
+                mkdir -p /workspace/src /workspace/outputs
+
+                cd /workspace/src
+
+                git init --quiet .
+
+                git remote add origin "https://github.com/rovco/prometheus_hypervisor_service_discovery.git"
+
+                git config --local credential.helper \
+                  '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
+
+                if ! git ls-remote --exit-code origin "refs/tags/${TAG}"
+                >/dev/null; then
+                  echo "tag '$TAG' does not exist on $(git remote get-url origin)" >&2
+                  exit 1
+                fi
+
+
+                git fetch --quiet --depth 1 origin
+                "refs/tags/${TAG}:refs/tags/${TAG}"
+
+
+                TAG_OBJECT=$(git rev-parse "refs/tags/${TAG}")
+
+                TAG_TYPE=$(git cat-file -t "$TAG_OBJECT")
+
+                PEELED_COMMIT=$(git rev-parse "refs/tags/${TAG}^{commit}")
+
+                if ! REVISION_TYPE=$(git cat-file -t "$REVISION" 2>/dev/null);
+                then
+                  echo "revision $REVISION is not an object reachable from fetched tag $TAG - rejecting" >&2
+                  exit 1
+                fi
+
+
+                case "$REVISION_TYPE" in
+                  tag)
+                    REVISION_PEELED=$(git rev-parse "${REVISION}^{commit}")
+                    ;;
+                  commit)
+                    REVISION_PEELED="$REVISION"
+                    ;;
+                  *)
+                    echo "unexpected object type '$REVISION_TYPE' for revision $REVISION" >&2
+                    exit 1
+                    ;;
+                esac
+
+
+                if [ "$REVISION_PEELED" != "$PEELED_COMMIT" ]; then
+                  echo "revision mismatch: supplied $REVISION ($REVISION_TYPE, peels to $REVISION_PEELED) does not match fetched tag $TAG (peels to $PEELED_COMMIT)" >&2
+                  exit 1
+                fi
+
+
+                git checkout --quiet "$PEELED_COMMIT"
+
+
+                printf '%s' "$TAG_OBJECT" > /workspace/outputs/tag-object.txt
+
+                printf '%s' "$PEELED_COMMIT" >
+                /workspace/outputs/peeled-commit.txt
+
+
+                echo "verified tag=$TAG tag_object=$TAG_OBJECT ($TAG_TYPE)
+                peeled_commit=$PEELED_COMMIT"
+            env:
+              - name: TAG
+                value: "{{inputs.parameters.tag}}"
+              - name: REVISION
+                value: "{{inputs.parameters.revision}}"
+              - name: GITHUB_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: melcloud-exporter-git
+                    key: token
+            resources:
+              limits:
+                cpu: 500m
+                memory: 256Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+            volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+            imagePullPolicy: IfNotPresent
+            securityContext:
+              capabilities:
+                drop:
+                  - ALL
+              allowPrivilegeEscalation: false
+          - name: main
+            image: docker.op.vaarst.io/docker_proxy/golang:1.27.3-bookworm
+            command:
+              - /bin/bash
+              - -c
+              - |
+                set -euo pipefail
+
+                : "${TAG:?}"
+                 IMAGE="docker.op.vaarst.io/vaarst_docker/pve-discovery:${TAG}-argo"
+
+                mkdir -p /workspace/outputs
+                mkdir -p "$GOCACHE" "$GOMODCACHE"
+
+                cd /workspace/src
+
+                printf '%s\n'  "========= Starting Build ========="
+
+                go build -o /workspace/outputs/pve-prometheus-service-discovery ./cmd/discovery
+
+                printf '%szn'  "========= Setup Oras ========="
+
+                curl -LO "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+                mkdir -p ${TOOLS_INSTALLDIR}/oras
+                tar -zxf oras_${ORAS_VERSION}_*.tar.gz -C ${TOOLS_INSTALLDIR}/oras
+
+                printf '%s\n'  "========= Upload Artifact ========="
+
+                OUTPUT=$(
+                  ${TOOLS_INSTALLDIR}/oras/oras push \
+                    --disable-path-validation \
+                    "docker.op.vaarst.io/go/pve-prometheus-service-discovery:${TAG}" \
+                    /workspace/outputs/pve-prometheus-service-discovery \
+                    --format json
+                )
+
+                printf '%s\n'  "========= Setup yq ========="
+
+                curl -LO https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-linux-amd64
+                mkdir -p ${TOOLS_INSTALLDIR}/jq
+                mv jq-linux-amd64 ${TOOLS_INSTALLDIR}/jq/jq
+                chmod +x /workspace/tools-install/jq/jq
+
+                printf '%s\n'  "========= Define Outputs ========="
+
+                DIGEST=$("${TOOLS_INSTALLDIR}/jq/jq" -r '.digest' <<< "$OUTPUT")
+                IMAGE=$("${TOOLS_INSTALLDIR}/jq/jq" -r '.referenceAsTags[0]' <<< "$OUTPUT")
+
+                printf '%s\n' "$DIGEST" > /workspace/outputs/manifest-digest.txt
+
+                printf '%s\n' "$IMAGE" > /workspace/outputs/image-reference.txt
+
+                printf '%s\n' "linux/amd64" > /workspace/outputs/platform.txt
+
+                echo "built image=$IMAGE digest=$DIGEST platform=linux/amd64"
+
+                printf '\n%s'  "========================="
+            env:
+              - name: TAG
+                value: "{{inputs.parameters.tag}}"
+              - name: DOCKER_CONFIG
+                value: /etc/buildkit-registry
+              - name: ORAS_VERSION
+                value: "1.3.4"
+              - name: TOOLS_INSTALLDIR
+                value: "/workspace/tools-install"
+              - name: GOCACHE
+                value: /workspace/.cache/go-build
+              - name: GOMODCACHE
+                value: /workspace/.cache/go-mod
+              - name: GOOS
+                value: linux
+              - name: GOARCH
+                value: amd64
+              - name: JQ_VERSION
+                value: "1.8.2"
+            resources:
+              limits:
+                cpu: "4"
+                memory: 2Gi
+              requests:
+                cpu: "1"
+                memory: 1Gi
+            volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+              - name: registry-config
+                readOnly: true
+                mountPath: /etc/buildkit-registry
+            imagePullPolicy: IfNotPresent
+            securityContext:
+              capabilities:
+                drop:
+                  - ALL
+              allowPrivilegeEscalation: false
+            dependencies:
+              - clone
+          - name: cleanup
+            image: docker.op.vaarst.io/docker_proxy/alpine/git@sha256:a4bb51f1a3553df194ce679fc1db721d8bfba2046fa1a88fe9d4ac551ffbce25
+            command:
+              - sh
+              - -c
+              - rm -rf /workspace/src
+            resources:
+              limits:
+                cpu: 100m
+                memory: 64Mi
+              requests:
+                cpu: 50m
+                memory: 32Mi
+            volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+            imagePullPolicy: IfNotPresent
+            securityContext:
+              capabilities:
+                drop:
+                  - ALL
+              allowPrivilegeEscalation: false
+            dependencies:
+              - main
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: registry-config
+          secret:
+            secretName: melcloud-exporter-registry
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+      activeDeadlineSeconds: 1800
+      retryStrategy:
+        limit: 1
+        retryPolicy: OnFailure
+        backoff:
+          duration: 30s
+          factor: "2"
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+  entrypoint: build
+  ttlStrategy:
+    secondsAfterCompletion: 43200
+  arguments:
+    parameters:
+      - name: tag
+      - name: revision
+  serviceAccountName: melcloud-exporter-ci

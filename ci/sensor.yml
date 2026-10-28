@@ -1,0 +1,72 @@
+---
+# yaml-language-server: $schema=https://datreeio.github.io/CRDs-catalog/argoproj.io/sensor_v1alpha1.json
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: melcloud-exporter-ci-sensor-ontag
+  namespace: argo-events
+spec:
+  eventBusName:
+  template:
+    serviceAccountName: melcloud-exporter-ci-events
+    container:
+      env:
+        - name: LOG_LEVEL
+          value: debug
+  dependencies:
+    - name: github-tag-push
+      eventSourceName: github
+      eventName: platform-repo
+      filters:
+        data:
+          - path: headers.X-Github-Event.0
+            type: string
+            value:
+              - ^push$
+          - path: body.repository.full_name
+            type: string
+            value:
+              - ^rovco/melcloud-exporter$
+          - path: body.deleted
+            type: bool
+            value:
+              - "false"
+          - path: body.ref
+            type: string
+            value:
+              - ^refs/tags/[0-9]+\.[0-9]+\.[0-9]+$
+  triggers:
+    - template:
+        name: melcloud-exporter-submit
+        argoWorkflow:
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                name: melcloud-exporter-pending
+                namespace: melcloud-exporter-ci
+              spec:
+                arguments:
+                  parameters:
+                    - name: tag
+                      value: ""
+                    - name: revision
+                      value: ""
+                serviceAccountName: melcloud-exporter-ci
+                workflowTemplateRef:
+                  name: melcloud-exporter-build
+          operation: submit
+          parameters:
+            - src:
+                dependencyName: github-tag-push
+                dataTemplate: '{{ .Input.body.ref | trimPrefix "refs/tags/" }}'
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: github-tag-push
+                dataKey: body.after
+              dest: spec.arguments.parameters.1.value
+            - src:
+                dependencyName: github-tag-push
+                dataTemplate: melcloud-exporter-{{ .Input.body.ref | trimPrefix "refs/tags/" }}
+              dest: metadata.name
